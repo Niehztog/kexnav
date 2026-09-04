@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+*.nav
+!tests/**/*.nav
+bspc.log
+.idea/
+out*/
+kexnav.local
