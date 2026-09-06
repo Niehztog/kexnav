@@ -1098,17 +1098,221 @@ def a_reach(areanum, travel=aas.TravelType.WALK):
     return aas.Reachability(areanum, 0, 0, (0, 0, 0), (0, 0, 0), int(travel), 1)
 
 
+def a_plane(normal, dist):
+    return aas.Plane(normal, dist, 0)
+
+
+def _ladder_world():
+    """A shaft with a ladder up one wall and a platform at the top.
+
+    Small enough to read, complete enough that ``point_area_num`` walks it:
+
+        z 256 +-----------------------+    area 3, the platform, floor z 192
+              |              .        |
+        z 192 |        #  .  +--------+
+              |        #  .           |    area 2, the climb, x < -32
+        z  64 |        #  .           |    # is the ladder face, x = -64
+              |        #  .           |    area 1, the shaft floor, floor z 0
+        z   0 +-----------------------+
+             x -320                x -32  x 128
+
+    Area 2 is flagged ``LADDER`` with no ground face, which is the whole point
+    -- it is the slice a climb passes through and a node has no business in.
+    The shaft floor is wide enough to hold lattice nodes of its own, so the
+    foot of the ladder is somewhere none of them is.
+    """
+    a = aas.AasFile()
+    a.planes = [a_plane((1.0, 0.0, 0.0), -32.0),    # 0: the platform's edge
+                a_plane((0.0, 0.0, 1.0), 192.0),    # 1: the platform's floor
+                a_plane((0.0, 0.0, 1.0), 64.0),     # 2: the bottom of the climb
+                a_plane((0.0, 0.0, 1.0), 0.0),      # 3: the shaft's floor
+                a_plane((1.0, 0.0, 0.0), -64.0),    # 4: the ladder face
+                a_plane((-1.0, 0.0, 0.0), 64.0)]    # 5: ... and its opposite
+    # node 0 is never entered; the walk starts at 1. A child <= 0 is the leaf
+    # for area -child, and 0 is solid.
+    a.nodes = [aas.Node(0, (0, 0)),
+               aas.Node(0, (2, 3)),
+               aas.Node(1, (-3, 0)),
+               aas.Node(2, (-2, -1))]
+    a.vertexes = [(-320.0, -32.0, 0.0), (-32.0, -32.0, 0.0),      # 0-3 floor
+                  (-32.0, 32.0, 0.0), (-320.0, 32.0, 0.0),
+                  (-64.0, -32.0, 64.0), (-64.0, 32.0, 64.0),      # 4-7 ladder
+                  (-64.0, 32.0, 192.0), (-64.0, -32.0, 192.0),
+                  (-32.0, -32.0, 192.0), (128.0, -32.0, 192.0),   # 8-11 top
+                  (128.0, 32.0, 192.0), (-32.0, 32.0, 192.0)]
+    a.edges = [(0, 0)] + [(i, (i + 1) % 4 + (i // 4) * 4) for i in range(12)]
+    a.edgeindex = list(range(1, 13))
+    a.faces = [aas.Face(0, 0, 0, 0, 0, 0),
+               aas.Face(3, int(aas.FaceFlags.GROUND), 4, 0, 1, 0),
+               aas.Face(4, int(aas.FaceFlags.LADDER), 4, 4, 2, 0),
+               aas.Face(1, int(aas.FaceFlags.GROUND), 4, 8, 3, 0)]
+    a.faceindex = [0, 1, 2, 3]
+    a.areas = [aas.Area(0, 0, 0, (0, 0, 0), (0, 0, 0), (0, 0, 0)),
+               aas.Area(1, 1, 1, (-320.0, -32.0, 0.0), (-32.0, 32.0, 64.0),
+                        (-176.0, 0.0, 32.0)),
+               aas.Area(2, 1, 2, (-320.0, -32.0, 64.0), (-32.0, 32.0, 192.0),
+                        (-176.0, 0.0, 128.0)),
+               aas.Area(3, 1, 3, (-32.0, -32.0, 192.0), (128.0, 32.0, 256.0),
+                        (48.0, 0.0, 224.0))]
+    a.areasettings = [
+        area_settings(),
+        area_settings(aas.AreaFlags.GROUNDED, first=0, count=0),
+        area_settings(aas.AreaFlags.LADDER, first=0, count=1),
+        area_settings(aas.AreaFlags.GROUNDED, first=1, count=0)]
+    # the top exit BSPC writes: 80 up and a step off the face
+    a.reachability = [aas.Reachability(3, 2, 0, (-60.0, 0.0, 160.0),
+                                       (-45.0, 0.0, 240.0),
+                                       int(aas.TravelType.LADDER), 10)]
+    return a
+
+
+class TestLadderPlane(unittest.TestCase):
+    """The one field a climb is steered by, and the one AAS hands over
+    backwards."""
+
+    def test_it_points_the_way_the_climber_steps_off(self):
+        # +1.00 against the horizontal start->end direction on all 237 corpus
+        # ladder traversals that have one
+        plane = convert.oriented_plane((1.0, 0.0, 0.0),
+                                       (0.0, 0.0, 0.0), (64.0, 0.0, 128.0))
+        self.assertEqual(plane, (1.0, 0.0, 0.0))
+
+    def test_an_aas_normal_facing_the_other_way_is_reversed(self):
+        plane = convert.oriented_plane((-1.0, 0.0, 0.0),
+                                       (0.0, 0.0, 0.0), (64.0, 0.0, 128.0))
+        self.assertEqual(plane, (1.0, 0.0, 0.0))
+
+    def test_a_vertical_climb_falls_back_to_reversing_the_aas_normal(self):
+        # AAS_Reachability_Ladder reaches the step-off with -15 * normal, so
+        # its normal is the inward one and the file wants the other
+        plane = convert.oriented_plane((0.0, 1.0, 0.0),
+                                       (0.0, 0.0, 0.0), (0.0, 0.0, 128.0))
+        self.assertEqual(plane, (0.0, -1.0, 0.0))
+
+
+class TestLadderColumns(unittest.TestCase):
+    """Which reachabilities are one physical ladder."""
+
+    def _aas(self, reaches):
+        a = _ladder_world()
+        a.reachability = reaches
+        a.areasettings[2] = area_settings(aas.AreaFlags.LADDER, first=0,
+                                          count=len(reaches))
+        return a
+
+    def _reach(self, start, end):
+        return aas.Reachability(3, 2, 0, start, end,
+                                int(aas.TravelType.LADDER), 10)
+
+    def test_stacked_chunks_of_one_ladder_group(self):
+        a = self._aas([self._reach((-60.0, 0.0, 64.0), (-60.0, 0.0, 128.0)),
+                       self._reach((-60.0, 0.0, 128.0), (-60.0, 0.0, 192.0))])
+        self.assertEqual(len(convert.ladder_columns(a)), 1)
+
+    def test_two_ladders_along_one_wall_do_not(self):
+        a = self._aas([self._reach((-60.0, -300.0, 64.0),
+                                   (-60.0, -300.0, 128.0)),
+                       self._reach((-60.0, 300.0, 64.0),
+                                   (-60.0, 300.0, 128.0))])
+        self.assertEqual(len(convert.ladder_columns(a)), 2)
+
+
+class TestLadderConversion(unittest.TestCase):
+    """A climb comes out as Nightdive writes one: a single link between two
+    nodes a player stands on, whose traversal restates them."""
+
+    def setUp(self):
+        self.stats = convert.Stats()
+        self.nav = convert.convert(_ladder_world(), stats=self.stats)
+        self.ladders = [(i, link) for i, link in enumerate(self.nav.links)
+                        if link.type == int(nav3.LinkType.LADDER)]
+
+    def _source(self, index):
+        for i, node in enumerate(self.nav.nodes):
+            if node.first_link <= index < node.first_link + node.num_links:
+                return i
+        raise AssertionError("link belongs to no node")
+
+    def _climb(self):
+        """The upward link of the pair, and its two nodes."""
+        for index, link in self.ladders:
+            foot = self._source(index)
+            if self.nav.nodes[link.target].origin[2] > \
+                    self.nav.nodes[foot].origin[2]:
+                return index, link, self.nav.nodes[foot], \
+                    self.nav.nodes[link.target]
+        raise AssertionError("no upward ladder link")
+
+    def test_the_whole_climb_is_one_link(self):
+        # and one descent: this shaft has no other way down, which is the
+        # case LADDER_REVERSE_WHEN_STRANDED exists for
+        self.assertEqual(self.stats.ladders, 1)
+        self.assertEqual(self.stats.ladders_reversed, 1)
+        self.assertEqual(len(self.ladders), 2)
+
+    def test_the_traversal_restates_its_two_nodes(self):
+        _, link, foot, top = self._climb()
+        traversal = self.nav.traversals[link.traversal]
+        self.assertEqual(traversal.start, foot.origin)
+        self.assertEqual(traversal.end, top.origin)
+
+    def test_both_ends_stand_on_a_floor(self):
+        _, _, foot, top = self._climb()
+        self.assertAlmostEqual(foot.origin[2], 0.0 - convert.FLOOR_OFFSET, 2)
+        self.assertAlmostEqual(top.origin[2], 192.0 - convert.FLOOR_OFFSET, 2)
+
+    def test_the_foot_is_flagged_and_tightened_and_the_top_is_not(self):
+        _, _, foot, top = self._climb()
+        self.assertTrue(foot.flags & int(nav3.NodeFlags.LADDER))
+        self.assertEqual(foot.radius, convert.LADDER_FOOT_RADIUS)
+        # the top is flagged here too, but only because this shaft needed a
+        # descent link and so the top is a ladder foot in its own right --
+        # mgu3m1, the corpus's one bidirectional ladder, reads the same
+        self.assertTrue(top.flags & int(nav3.NodeFlags.LADDER))
+
+    def test_the_plane_points_out_of_the_wall(self):
+        # and is the same vector on the way back down, as mgu3m1's pair is
+        for index, link in self.ladders:
+            traversal = self.nav.traversals[link.traversal]
+            self.assertEqual(traversal.ladder_plane, (1.0, 0.0, 0.0))
+
+    def test_no_node_is_left_in_the_slice_the_climb_passes_through(self):
+        stranded = [n for n in self.nav.nodes if 64.0 < n.origin[2] < 168.0]
+        self.assertEqual(stranded, [])
+
+    def test_the_foot_is_walk_linked_to_the_floor_it_stands_on(self):
+        index, _, _, _ = self._climb()
+        foot = self._source(index)
+        walks = [l for l in self.nav.links
+                 if l.target == foot and l.type == int(nav3.LinkType.WALK)]
+        self.assertTrue(walks, "nothing can walk to the foot of the ladder")
+
+    def test_the_file_is_structurally_clean(self):
+        self.assertEqual(validate.check(self.nav), [])
+
+
 class TestUsableAreas(unittest.TestCase):
     """A node can only sit in an area usable_areas returns, so anything it
     leaves out silently drops every reachability that ends there."""
 
-    def test_grounded_liquid_and_ladder_areas_are_usable(self):
+    def test_grounded_and_liquid_areas_are_usable(self):
         a = an_aas([area_settings(),                       # 0, the dummy
                     area_settings(aas.AreaFlags.GROUNDED),
                     area_settings(aas.AreaFlags.LIQUID),
-                    area_settings(aas.AreaFlags.LADDER),
                     area_settings()], [])
-        self.assertEqual(convert.usable_areas(a), [1, 2, 3])
+        self.assertEqual(convert.usable_areas(a), [1, 2])
+
+    def test_an_area_a_climb_only_passes_through_is_not_usable(self):
+        # a LADDER area with no ground face and no liquid is a slice of
+        # mid-air held up by a ladder brush; Nightdive has no node in one, and
+        # ladder_pairs puts the whole climb back as a single link
+        a = an_aas([area_settings(),
+                    area_settings(aas.AreaFlags.LADDER),
+                    area_settings(aas.AreaFlags.LADDER
+                                  | aas.AreaFlags.GROUNDED),
+                    area_settings(aas.AreaFlags.LADDER
+                                  | aas.AreaFlags.LIQUID)], [])
+        self.assertEqual(convert.usable_areas(a), [2, 3])
 
     def test_a_reachability_endpoint_is_usable_whatever_its_flags(self):
         # the standing spot on a raised plat is routinely a mover area with no

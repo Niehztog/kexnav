@@ -111,11 +111,13 @@ MIN_NODE_SEPARATION = 64.0
 #: on open floor because a crawlspace next door borrowed the node, would both
 #: be wrong.
 #:
-#: These four are different: they say "something special is reachable from
+#: These three are different: they say "something special is reachable from
 #: here" rather than "this spot is like this", and the engine needs them set
-#: for the node the link actually starts from.
+#: for the node the link actually starts from. ``LADDER`` would belong here
+#: too, but :func:`node_flags` never returns it -- a ladder's foot node gets
+#: it directly, so there is nothing to borrow.
 BORROWABLE_NODE_FLAGS = int(nav3.NodeFlags.TELEPORTER | nav3.NodeFlags.PUSHER
-                            | nav3.NodeFlags.ELEVATOR | nav3.NodeFlags.LADDER)
+                            | nav3.NodeFlags.ELEVATOR)
 
 #: The radius within which a node is merged *regardless* of connectivity.
 #:
@@ -344,6 +346,125 @@ PUSH_MAX_HORIZONTAL = 320.0
 #: simply walk between, the walk is the link that survives.
 ENTITY_LINK_COST = 1e6
 
+# -- ladders ---------------------------------------------------------------
+#
+# A whole physical ladder becomes **one** ``LADDER`` link, from a node at its
+# foot to a node on the floor at the top, and that is not a simplification of
+# BSPC's output -- it is what the format wants. Measured over the corpus's 272
+# ladder links:
+#
+#   * ``traversal.start`` equals the source node's origin and ``traversal.end``
+#     the target's, to the last bit, in **272 of 272**. The traversal is not an
+#     independent path; it restates the two nodes. A link whose traversal
+#     begins somewhere the bot is not cannot be executed, which is what
+#     BSPC's own endpoints produced: snapped to the nearest lattice node they
+#     landed a median 50-80 units, and up to 368, from where the climb starts.
+#   * the source node carries :attr:`~kexnav.nav3.NodeFlags.LADDER` in 254 and
+#     the target does not in 246. Nightdive marks 277 nodes ``LADDER`` in
+#     66424 -- one per ladder, not one per area a climb passes through.
+#   * 269 of 272 go **up**, 268 of 270 source nodes have exactly one, and 262
+#     have no reverse link at all: a bot descends by walking off the top, and
+#     the foot is still reachable from the top by some other route on 268 of
+#     the 272.
+#
+# BSPC instead reports a ladder as a chain of one reachability per pair of
+# ladder areas, 64 units of climb each, in both directions, plus a
+# ``TRAVEL_JUMP`` onto the bottom rung -- ``AAS_Reachability_Ladder`` in
+# ``be_aas_reach.c``. Those chunk boundaries are mid-air positions on the
+# ladder, which is a fine way to *simulate* a climb and a useless place for a
+# waypoint. So the chain is collapsed here and the areas it passes through are
+# left without nodes; see :func:`usable_areas`.
+
+#: How close two ladder reachabilities must be, horizontally, to be the same
+#: physical ladder. They share the ladder face's plane already -- that is the
+#: first half of the grouping -- so this only has to separate two ladders on
+#: one wall. Consecutive chunks of one ladder are stacked vertically and their
+#: endpoints agree in xy to within the 3 units ``AAS_Reachability_Ladder``
+#: pushes an end off the face, so the threshold has three orders of slack at
+#: the bottom; at the top, no pair of Nightdive's own ladders on a shared wall
+#: plane sits this close.
+LADDER_COLUMN_RADIUS = 48.0
+
+#: Sideways probe offsets when looking for the floor at a ladder's foot, in
+#: units along the ladder face's normal. Signed, and tried in this order.
+#:
+#: The endpoints BSPC hands over sit *on* the ladder face -- ``area1point`` is
+#: the shared edge's midpoint slid along the face -- so ``AAS_PointAreaNum``
+#: is being asked about a boundary plane and answers "solid" often enough to
+#: matter: 244 of 664 columns over the 193 stock maps found no floor at offset
+#: 0 alone. Both signs are tried because which side of the face is open is not
+#: knowable from the plane: on q2dm2 the free space is on the normal's far
+#: side, on badlands the near one. A probe into solid costs a tree walk and
+#: returns nothing, so guessing wrong is only ever slow.
+LADDER_PROBE_OFFSETS = (0.0, 4.0, -4.0, 8.0, -8.0, 16.0, -16.0, 24.0, -24.0)
+
+#: The same for the step-off point at the top, which needs to reach further:
+#: Nightdive's own top nodes sit a median 45 units out from the ladder face
+#: (p10 17, p90 82), because the node goes where you land, not on the lip.
+LADDER_TOP_OFFSETS = (0.0, 8.0, -8.0, 16.0, -16.0, 24.0, -24.0, 32.0, -32.0,
+                      40.0, 48.0, 56.0, 64.0)
+
+#: How far below the top step-off point its floor may be. ``area2point`` is
+#: 32 units above the top shared edge and the reachability's end another 16,
+#: so the platform is ~48 down; 96 leaves room for a step without letting the
+#: probe fall back down the shaft it just climbed.
+LADDER_TOP_DROP = 96.0
+
+#: How far below the bottom rung to look for the floor. Generous on purpose:
+#: a ladder that starts well above its floor is normal -- Nightdive's own foot
+#: nodes sit a median 80 units below the lowest AAS endpoint, and 200 at the
+#: tenth percentile -- and the scan stops at the first floor it finds anyway.
+LADDER_FOOT_DROP = 512.0
+
+#: How far up the floor probe starts, and its step.
+#:
+#: The rise clears the ground plane the endpoint may be sitting exactly on.
+#: The step is :data:`PUSH_COLUMN_STEP`'s, for the same reason and with the
+#: same cost: an area only a few units thick is a real thing to land on and a
+#: coarser walk steps over it. ``mals_ladder_test``'s upper floor is one --
+#: area 18 spans z 260 to 264 -- and an 8-unit scan missed all four of that
+#: map's ladders. Samples are also phased to the middle of a step, because
+#: Quake geometry sits on integer bounds and ``AAS_PointAreaNum`` asked about
+#: a boundary plane answers with the solid side.
+LADDER_PROBE_RISE = 24.0
+LADDER_PROBE_STEP = 4.0
+
+#: Below this much climb a ladder is not worth a link -- a bot walks or steps
+#: up 32 units without help, and a column this short is usually a ladder
+#: texture on a doorway rather than a route. 19 of 664 stock columns.
+LADDER_MIN_CLIMB = 32.0
+
+#: ``node.radius`` for a ladder's foot node. Every one of Nightdive's 277
+#: ``LADDER``-flagged nodes has it: 276 at 4 and one at 12, against 32 on
+#: 63053 of 66424 nodes overall. ``Nav_NodeReached`` compares it against the
+#: horizontal distance to the node, so 4 is the engine being told the bot must
+#: be *at* the ladder, not near it, before the climb counts as begun.
+LADDER_FOOT_RADIUS = 4
+
+#: Whether to describe the climb back *down* as well.
+#:
+#: Nightdive almost never does: 269 of 272 ladder links go up, and 262 have no
+#: reverse at all -- a bot gets down by walking off the top, and the foot is
+#: still reachable from the top by some other route on 268 of the 272. So a
+#: reverse link goes in only where that is *not* true and the descent would
+#: otherwise be lost, which is 24 of the arena set's 324 climbs, both times on
+#: a map whose shaft has no stairs.
+#:
+#: ``mgu3m1`` is the corpus's one bidirectional ladder and settles how to
+#: write it: n499->n500 and n500->n499, both source nodes flagged ``LADDER``
+#: at radius 4, and **the same plane vector on both** -- its dot product with
+#: the direction of travel is +1.0 going up and -1.0 coming down, so the field
+#: describes the ladder and not the move.
+LADDER_REVERSE_WHEN_STRANDED = True
+
+#: How close an existing node has to be to serve as a ladder endpoint instead
+#: of a new one. Tight at the foot because the traversal starts there and a
+#: node one lattice cell away is a node off the ladder; loose at the top
+#: because that is where Nightdive's own node sits -- a median 45 units from
+#: the face -- and a lattice node on the platform is the same place.
+LADDER_FOOT_REUSE = 16.0
+LADDER_TOP_REUSE = 64.0
+
 #: Link types that get a nav edict, when a mover model can be identified. Every
 #: one of the corpus's 514 ELEVATOR links has an edict, and 55 of 56 TRAINs.
 #: The corpus also puts edicts on 480 WALK links -- doors and buttons on the
@@ -354,8 +475,19 @@ NEEDS_EDICT = frozenset({nav3.LinkType.ELEVATOR, nav3.LinkType.TRAIN})
 #: Nightdive's own files do instead. Kept as data so ``kexnav.py check`` can
 #: report it and so the list cannot quietly rot.
 GAPS = (
-    ("node.radius", "constant 32; Nightdive hand-tightens 4% of nodes, and "
-                    "the value does not correlate with AAS area extents"),
+    ("node.radius", "32 everywhere but a ladder's foot, which gets 4 the way "
+                    "all 277 of Nightdive's LADDER nodes do. Nightdive "
+                    "hand-tightens another 4% of nodes besides, and that part "
+                    "is not reproduced: the value does not correlate with AAS "
+                    "area extents"),
+    ("which ladders exist",
+     "one climb per group of BSPC LADDER reachabilities sharing a wall plane "
+     "and a column, which is more than Nightdive waypoints -- 476 columns "
+     "resolve over the 193 stock maps against their 272 links, and 181 of "
+     "those 272 have a generated foot within 96 units (median 19). The "
+     "surplus is real ladder surface BSPC found and a hand author skipped; "
+     "the shortfall is mostly a column whose top or foot has no floor in the "
+     "AAS at all, counted in Stats.ladders_unresolved"),
     ("ELEVATOR traversal.funnel", "left unset; Nightdive points it at an "
                                   "adjacent node's origin (510 of 513), which "
                                   "node being unexplained"),
@@ -434,9 +566,12 @@ class Stats:
     edicts_unresolved: int = 0
     teleports: int = 0
     pushes: int = 0
+    ladders: int = 0
+    ladders_reversed: int = 0
     nodes_synthesised: int = 0
     teleporters_unresolved: Dict[str, int] = field(default_factory=collections.Counter)
     pushers_unresolved: Dict[str, int] = field(default_factory=collections.Counter)
+    ladders_unresolved: Dict[str, int] = field(default_factory=collections.Counter)
 
 
 class ConvertError(Exception):
@@ -555,11 +690,16 @@ def node_flags(a, areanum, elevator_targets=()):
     bits are omitted deliberately -- q2pro-ng groups them as a mask of things
     the engine re-evaluates at runtime, so there is nothing static to compute
     -- and so is ``DISABLED``, which no shipped file uses.
+
+    ``LADDER`` is deliberately absent: it belongs to the one node at a
+    ladder's foot, which :func:`convert` sets it on directly, and not to every
+    area a climb touches. Nightdive marks 277 nodes with it in 66424, and
+    q2pro-ng's ``nav.c`` excludes a ``LADDER`` node from its node searches, so
+    spending the flag on ordinary floor costs more than the description is
+    worth.
     """
     s = a.areasettings[areanum]
     flags = 0
-    if s.ladder:
-        flags |= nav3.NodeFlags.LADDER
     if s.contents & (aas.AreaContents.WATER | aas.AreaContents.SLIME
                      | aas.AreaContents.LAVA):
         flags |= nav3.NodeFlags.UNDER_WATER
@@ -624,6 +764,8 @@ def ladder_plane_for(a, reach):
     climber is on. Measured on Nightdive's files the plane is a unit vector in
     all 264 ladder traversals, and horizontal in all of them (x or y aligned in
     249, oblique in 15), so it is the wall normal rather than a plane equation.
+
+    Which *way* it points is not decided here -- see :func:`oriented_plane`.
     """
     facenum = reach.facenum
     if not facenum or abs(facenum) >= len(a.faces):
@@ -635,6 +777,204 @@ def ladder_plane_for(a, reach):
     if length < 1e-6:
         return None
     return (normal[0] / length, normal[1] / length, normal[2] / length)
+
+
+def oriented_plane(normal, start, end):
+    """`normal` signed the way Nightdive writes a ladder plane.
+
+    The convention is measured, and it is not the one AAS hands over. On all
+    237 corpus ladder traversals whose two nodes differ horizontally, the
+    plane's dot product with the horizontal ``start``->``end`` direction is
+    ``+1.00`` (165 exactly, 43 at 0.99, the rest above 0.8): it points the way
+    the climber steps off at the top, out of the wall.
+
+    ``AAS_Reachability_Ladder`` orients the same face the other way -- it
+    reaches the step-off with ``VectorMA(end, -15, plane1->normal, end)`` --
+    and the dot product measured against BSPC's own reachabilities comes back
+    ``-1.0`` on 619 of 621 upward ones. So :func:`ladder_plane_for` alone is
+    180 degrees out, which is a field the engine steers by.
+
+    Falls back to reversing the AAS normal when the two nodes are stacked
+    vertically and there is no horizontal direction to agree with.
+    """
+    dx, dy = end[0] - start[0], end[1] - start[1]
+    if math.hypot(dx, dy) < 1.0:
+        return (-normal[0], -normal[1], -normal[2])
+    if dx * normal[0] + dy * normal[1] < 0.0:
+        return (-normal[0], -normal[1], -normal[2])
+    return normal
+
+
+def _ladder_face_plane(a, reach):
+    """The unsigned plane index of a ladder reachability's face, for grouping.
+
+    AAS stores planes in opposed pairs -- verified over 12000 pairs in the
+    stock cache, ``planes[n ^ 1].normal == -planes[n].normal`` every time --
+    so dropping the low bit names the wall irrespective of which side of it a
+    given reachability was written from.
+    """
+    facenum = abs(reach.facenum)
+    if not facenum or facenum >= len(a.faces):
+        return None
+    return a.faces[facenum].planenum & ~1
+
+
+def ladder_columns(a):
+    """Group ``LADDER`` reachabilities into physical ladders.
+
+    Two of them belong to the same ladder when they lie on the same wall --
+    :func:`_ladder_face_plane` -- and come within
+    :data:`LADDER_COLUMN_RADIUS` of each other horizontally. Union-find over
+    that relation, so a chain of chunks joins up however long the climb.
+
+    Returns a list of ``[(area number, reachability), ...]``.
+    """
+    lad = [(i, r) for i in range(1, len(a.areasettings))
+           for r in a.area_reachabilities(i)
+           if r.travel_type == aas.TravelType.LADDER]
+    parent = list(range(len(lad)))
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    by_plane = collections.defaultdict(list)
+    for k, (i, r) in enumerate(lad):
+        by_plane[_ladder_face_plane(a, r)].append(k)
+    for plane, ks in by_plane.items():
+        if plane is None:
+            continue
+        for x in range(len(ks)):
+            for y in range(x + 1, len(ks)):
+                ra, rb = lad[ks[x]][1], lad[ks[y]][1]
+                near = min(math.dist(u[:2], v[:2])
+                           for u in (ra.start, ra.end)
+                           for v in (rb.start, rb.end))
+                if near <= LADDER_COLUMN_RADIUS:
+                    fx, fy = find(ks[x]), find(ks[y])
+                    if fx != fy:
+                        parent[fx] = fy
+
+    groups = collections.defaultdict(list)
+    for k, entry in enumerate(lad):
+        groups[find(k)].append(entry)
+    return list(groups.values())
+
+
+def _ground_below(a, point, usable, limit):
+    """``(area, nav origin)`` where a player released at `point` comes to rest.
+
+    `point` is a player origin in AAS space. The scan starts
+    :data:`LADDER_PROBE_RISE` above it so a point sitting exactly on a ground
+    plane resolves to the area above rather than the solid below, and stops at
+    the first grounded area whose own floor is at or under the probe -- the
+    height test is what keeps a tall convex shaft from reporting the floor of
+    the storey above. A liquid area is remembered as a fallback, because the
+    bottom of a ladder is water often enough to matter.
+
+    ``(0, None)`` when nothing is found.
+    """
+    fallback = (0, None)
+    z = point[2] + LADDER_PROBE_RISE
+    z = (math.floor(z / LADDER_PROBE_STEP) + 0.5) * LADDER_PROBE_STEP
+    while z >= point[2] - limit:
+        num = a.point_area_num((point[0], point[1], z))
+        if num and num in usable:
+            s = a.areasettings[num]
+            if s.grounded:
+                face = a.ground_face(num)
+                ground = z
+                if face is not None:
+                    pts = a.face_points(face)
+                    ground = sum(q[2] for q in pts) / len(pts)
+                if ground <= z + 1.0:
+                    return num, (point[0], point[1], ground - FLOOR_OFFSET)
+            elif not fallback[0] and s.liquid:
+                fallback = (num, (point[0], point[1], z - FLOOR_OFFSET))
+        z -= LADDER_PROBE_STEP
+    return fallback
+
+
+def _ladder_floor(a, point, normal, offsets, usable, limit):
+    """The first floor found probing sideways from `point` off a ladder face.
+
+    See :data:`LADDER_PROBE_OFFSETS` for why the offsets are signed and why
+    zero is not enough on its own.
+    """
+    for d in offsets:
+        found = _ground_below(a, (point[0] + normal[0] * d,
+                                  point[1] + normal[1] * d, point[2]),
+                              usable, limit)
+        if found[0]:
+            return found
+    return (0, None)
+
+
+def ladder_pairs(a, usable):
+    """One climb per physical ladder: the foot and the top of each.
+
+    Yields ``(foot area, foot origin, top area, top origin, ladder plane,
+    cost)`` in nav space, plus a counter of why the rest were dropped. The
+    plane is oriented from the two points resolved *here* rather than from the
+    nodes they end up on: the top point is directly out from the ladder face
+    by construction, while a reused lattice node can sit off to one side and
+    make :func:`oriented_plane`'s sign turn on a few degrees.
+
+    The foot is the lowest ``start`` of the column's reachabilities dropped to
+    the floor, and the top the highest ``end`` -- the two ends of what BSPC
+    simulated, each resolved to a place a player stands rather than a place
+    the climb passes through.
+    """
+    unresolved = collections.Counter()
+    out = []
+    for group in ladder_columns(a):
+        normal = None
+        for _, r in group:
+            normal = ladder_plane_for(a, r)
+            if normal:
+                break
+        if normal is None:
+            unresolved["no ladder face to take a plane from"] += 1
+            continue
+
+        # A reachability leaving a ladder area starts inside it; one leaving
+        # the floor at the bottom does not, so prefer the former.
+        starts = [r.start for i, r in group if a.areasettings[i].ladder]
+        foot = _ladder_floor(a, min(starts or [r.start for _, r in group],
+                                    key=lambda p: p[2]),
+                             normal, LADDER_PROBE_OFFSETS, usable,
+                             LADDER_FOOT_DROP)
+        if not foot[0]:
+            unresolved["no floor under the ladder foot"] += 1
+            continue
+
+        # The step-off: the highest end of an upward reachability, which for
+        # the top of the chain is already 16 units above the last rung and 15
+        # out from the face. The floor it lands on has to be above the foot,
+        # or the probe has fallen back down the shaft it just climbed.
+        ends = [r.end for _, r in group if r.end[2] > r.start[2]]
+        hi = max(ends or [r.end for _, r in group], key=lambda p: p[2])
+        top = (0, None)
+        for d in LADDER_TOP_OFFSETS:
+            found = _ground_below(a, (hi[0] + normal[0] * d,
+                                      hi[1] + normal[1] * d, hi[2]),
+                                  usable, LADDER_TOP_DROP)
+            if found[0] and found[1][2] > foot[1][2]:
+                top = found
+                break
+        if not top[0]:
+            unresolved["no floor at the ladder top"] += 1
+            continue
+        if top[1][2] - foot[1][2] < LADDER_MIN_CLIMB:
+            unresolved[f"climb under {LADDER_MIN_CLIMB:g} units"] += 1
+            continue
+
+        cost = float(sum(r.traveltime for _, r in group)) or 1.0
+        plane = oriented_plane(normal, foot[1], top[1])
+        out.append((foot[0], foot[1], top[0], top[1], plane, cost))
+    return out, unresolved
 
 
 #: Heights to probe above a teleporter entity's origin, in AAS space.
@@ -1078,17 +1418,22 @@ def usable_areas(a):
 
     Grounded areas are the backbone. Liquid areas come too -- Nightdive's files
     carry 2060 ``UNDER_WATER`` nodes, so swimming is navigated, and dropping
-    them would orphan every ``SWIM`` and ``WATERJUMP`` reachability. Ladder
-    areas likewise: 171 corpus AAS areas are ladder-but-not-grounded, and a
-    climb passes through them.
+    them would orphan every ``SWIM`` and ``WATERJUMP`` reachability.
 
-    And finally **any area BSPC gave a reachability to or from**, whatever its
-    flags say. That is not a loosening: BSPC's movement simulation established
-    that a player gets there, which is a stronger statement than a flag. It is
-    also small and it pays -- over the 28-map arena set it adds 55 areas to
-    53721 and recovers 119 reachabilities that had nowhere to attach, 62 of
-    them ``ELEVATOR`` rides, because the standing spot on a raised plat is
+    And **any area BSPC gave a reachability to or from**, whatever its flags
+    say. That is not a loosening: BSPC's movement simulation established that
+    a player gets there, which is a stronger statement than a flag. It is also
+    small and it pays -- over the 28-map arena set it adds 55 areas to 53721
+    and recovers 119 reachabilities that had nowhere to attach, 62 of them
+    ``ELEVATOR`` rides, because the standing spot on a raised plat is
     frequently a mover area with no ground face of its own.
+
+    What is left out is the area a climb *passes through*: flagged ``LADDER``,
+    with no ground face and no liquid, it is a slice of mid-air held up by a
+    ladder brush, and a node there is a waypoint a bot cannot stand on.
+    Nightdive has none -- 277 ``LADDER`` nodes in 66424, one per ladder, all of
+    them at a foot. The climb over them is put back whole by
+    :func:`ladder_pairs`, so this drops the waypoints and not the route.
     """
     endpoint = set()
     for i in range(1, len(a.areasettings)):
@@ -1100,7 +1445,9 @@ def usable_areas(a):
     for i, s in enumerate(a.areasettings):
         if not i:
             continue                      # area 0 is the dummy
-        if s.grounded or s.liquid or s.ladder or i in endpoint:
+        if s.ladder and not (s.grounded or s.liquid):
+            continue
+        if s.grounded or s.liquid or i in endpoint:
             out.append(i)
     return out
 
@@ -1137,6 +1484,7 @@ def convert(a, b=None, heuristic=DEFAULT_HEURISTIC, version=nav3.VERSION,
     # -- nodes: one lattice of them per area -------------------------------
     origins = []                      # node index -> nav-space origin
     flags = []                        # node index -> nav_node_flags_t
+    radii = []                        # node index -> node.radius
     area_nodes = {}                   # area number -> [node index, ...]
     lattice = {}                      # (area number, i, j) -> node index
     lattice_by_area = collections.defaultdict(list)   # area -> [(i, j), ...]
@@ -1158,6 +1506,7 @@ def convert(a, b=None, heuristic=DEFAULT_HEURISTIC, version=nav3.VERSION,
                 index = len(origins)
                 origins.append(origin)
                 flags.append(area_flags)
+                radii.append(DEFAULT_RADIUS)
                 node_areas.append({num})
                 near.add(index, origin)
                 clearance.add(index, origin)
@@ -1183,8 +1532,12 @@ def convert(a, b=None, heuristic=DEFAULT_HEURISTIC, version=nav3.VERSION,
     # endpoints are snapped, and the corpus has no duplicate node pair.
     chosen = {}
 
-    def offer(src, dst, link_type, reach, cost):
-        """Keep the cheapest connection between a node pair."""
+    def offer(src, dst, link_type, reach, cost, plane=None):
+        """Keep the cheapest connection between a node pair.
+
+        `plane` is set only by a synthesised ladder, which has no
+        reachability to carry its traversal and describes itself instead.
+        """
         if src == dst:
             return False
         key = (src, dst)
@@ -1193,7 +1546,7 @@ def convert(a, b=None, heuristic=DEFAULT_HEURISTIC, version=nav3.VERSION,
             if old[2] <= cost:
                 return False
             st.dropped_duplicate += 1
-        chosen[key] = (link_type, reach, cost)
+        chosen[key] = (link_type, reach, cost, plane)
         return True
 
     # intra-area: the lattice. Cost 0 so a real reachability never loses to
@@ -1211,6 +1564,10 @@ def convert(a, b=None, heuristic=DEFAULT_HEURISTIC, version=nav3.VERSION,
     for num in areas:
         for r in a.area_reachabilities(num):
             travel = r.travel_type
+            if travel == aas.TravelType.LADDER:
+                # One climb, synthesised below, replaces the whole chain of
+                # them -- see the ladder constants.
+                continue
             link_type = TRAVEL_TO_LINK.get(travel)
             if link_type is None:
                 st.dropped_travel[_travel_name(travel)] += 1
@@ -1233,9 +1590,9 @@ def convert(a, b=None, heuristic=DEFAULT_HEURISTIC, version=nav3.VERSION,
     pairs, unresolved = teleport_pairs(a, b, area_nodes)
     for src_area, src_point, dst_area, dst_point in pairs:
         src = _entity_endpoint(a, src_area, src_point, origins, flags,
-                               area_nodes, spacing, offer, st)
+                               radii, area_nodes, spacing, offer, st)
         dst = _entity_endpoint(a, dst_area, dst_point, origins, flags,
-                               area_nodes, spacing, offer, st)
+                               radii, area_nodes, spacing, offer, st)
         if src is None:
             unresolved["pad unreachable, no node within the spacing"] += 1
             continue
@@ -1250,14 +1607,14 @@ def convert(a, b=None, heuristic=DEFAULT_HEURISTIC, version=nav3.VERSION,
     pads, unresolved = push_pairs(a, b, area_nodes)
     for src_area, src_point, landings in pads:
         src = _entity_endpoint(a, src_area, src_point, origins, flags,
-                               area_nodes, spacing, offer, st)
+                               radii, area_nodes, spacing, offer, st)
         if src is None:
             unresolved["pad unreachable, no node within the spacing"] += 1
             continue
         made = 0
         for dst_area, dst_point in landings:
             dst = _entity_endpoint(a, dst_area, dst_point, origins, flags,
-                                   area_nodes, spacing, offer, st)
+                                   radii, area_nodes, spacing, offer, st)
             if dst is None:
                 continue
             if offer(src, dst, nav3.LinkType.PUSHER, None, ENTITY_LINK_COST):
@@ -1272,6 +1629,49 @@ def convert(a, b=None, heuristic=DEFAULT_HEURISTIC, version=nav3.VERSION,
             unresolved["no landing a link could attach to"] += 1
     st.pushers_unresolved.update(unresolved)
 
+    # Ladders: one link for the whole climb, between two nodes that stand at
+    # its ends, because that is the only shape the format describes -- see the
+    # ladder constants. Cost is BSPC's own traveltime for the chain, so a
+    # walkable route between the same two nodes still wins.
+    climbs, unresolved = ladder_pairs(a, set(areas))
+    made_climbs = []
+    for foot_area, foot_origin, top_area, top_origin, plane, cost in climbs:
+        foot = _ladder_endpoint(foot_area, foot_origin,
+                                node_flags(a, foot_area, elevator_targets),
+                                LADDER_FOOT_REUSE, origins, flags, radii,
+                                area_nodes, offer, st)
+        top = _ladder_endpoint(top_area, top_origin,
+                               node_flags(a, top_area, elevator_targets),
+                               LADDER_TOP_REUSE, origins, flags, radii,
+                               area_nodes, offer, st)
+        if foot is None or top is None:
+            unresolved["an end has no node to attach to"] += 1
+            continue
+        if not offer(foot, top, nav3.LinkType.LADDER, None, cost, plane):
+            unresolved["a cheaper link already joins the two ends"] += 1
+            continue
+        st.ladders += 1
+        made_climbs.append((foot, top, plane, cost))
+        flags[foot] |= int(nav3.NodeFlags.LADDER)
+        radii[foot] = LADDER_FOOT_RADIUS
+    st.ladders_unresolved.update(unresolved)
+
+    # A climb whose foot nothing else can get back to. Since the link itself
+    # makes the top reachable from the foot, "the foot is reachable from the
+    # top" is the same question as "are they in one strongly connected
+    # component", which is one pass over the graph rather than one search per
+    # ladder. See LADDER_REVERSE_WHEN_STRANDED.
+    if made_climbs and LADDER_REVERSE_WHEN_STRANDED:
+        component = _strong_components(chosen, len(origins))
+        for foot, top, plane, cost in made_climbs:
+            if component[foot] == component[top]:
+                continue
+            if not offer(top, foot, nav3.LinkType.LADDER, None, cost, plane):
+                continue
+            st.ladders_reversed += 1
+            flags[top] |= int(nav3.NodeFlags.LADDER)
+            radii[top] = LADDER_FOOT_RADIUS
+
     # -- prune, renumber ---------------------------------------------------
     live = set()
     for (src, dst) in chosen:
@@ -1285,8 +1685,9 @@ def convert(a, b=None, heuristic=DEFAULT_HEURISTIC, version=nav3.VERSION,
     renumber = {old: new for new, old in enumerate(keep)}
 
     per_node = collections.defaultdict(list)
-    for (src, dst), (link_type, reach, _cost) in chosen.items():
-        per_node[renumber[src]].append((renumber[dst], link_type, reach))
+    for (src, dst), (link_type, reach, _cost, plane) in chosen.items():
+        per_node[renumber[src]].append(
+            (renumber[dst], link_type, reach, plane))
     for links in per_node.values():
         links.sort(key=lambda t: t[0])
 
@@ -1294,20 +1695,28 @@ def convert(a, b=None, heuristic=DEFAULT_HEURISTIC, version=nav3.VERSION,
     nav = nav3.NavFile(version=version, heuristic=heuristic)
     for old in keep:
         nav.nodes.append(nav3.Node(flags=flags[old], num_links=0, first_link=0,
-                                   radius=DEFAULT_RADIUS, origin=origins[old]))
+                                   radius=radii[old], origin=origins[old]))
     for src, node in enumerate(nav.nodes):
         node.first_link = len(nav.links)
         links = per_node.get(src, ())
         node.num_links = len(links)
-        for dst, link_type, reach in links:
+        for dst, link_type, reach, plane in links:
             traversal = nav3.NO_TRAVERSAL
-            if reach is not None and link_type in NEEDS_TRAVERSAL:
+            if plane is not None:
+                # A synthesised ladder. Its traversal restates its two nodes,
+                # which is what all 272 of Nightdive's do, to the bit.
+                start, end = node.origin, nav.nodes[dst].origin
+                ladder = (plane if version >= nav3.VERSION_LADDER_PLANE
+                          else None)
+                traversal = len(nav.traversals)
+                nav.traversals.append(nav3.Traversal(
+                    funnel=(nav3.UNSET_COORD,) * 3,
+                    start=start, end=end, ladder_plane=ladder))
+            elif reach is not None and link_type in NEEDS_TRAVERSAL:
                 start, end = _sub_z(reach.start), _sub_z(reach.end)
                 ladder = None
                 if version >= nav3.VERSION_LADDER_PLANE:
                     ladder = (0.0, 0.0, 0.0)
-                    if link_type == nav3.LinkType.LADDER:
-                        ladder = ladder_plane_for(a, reach) or (0.0, 0.0, 0.0)
                 traversal = len(nav.traversals)
                 nav.traversals.append(nav3.Traversal(
                     funnel=funnel_for(link_type, start, end),
@@ -1333,6 +1742,53 @@ def convert(a, b=None, heuristic=DEFAULT_HEURISTIC, version=nav3.VERSION,
     st.edicts = len(nav.edicts)
     _check_limits(nav)
     return nav
+
+
+def _strong_components(chosen, count):
+    """Strongly connected component index per node, over the chosen links.
+
+    Kosaraju, iterative on both passes, because a generated graph runs to tens
+    of thousands of nodes and the recursion limit is 1000.
+    """
+    out = [[] for _ in range(count)]
+    into = [[] for _ in range(count)]
+    for src, dst in chosen:
+        out[src].append(dst)
+        into[dst].append(src)
+
+    order = []
+    seen = [False] * count
+    for start in range(count):
+        if seen[start]:
+            continue
+        seen[start] = True
+        stack = [(start, 0)]
+        while stack:
+            v, i = stack.pop()
+            if i < len(out[v]):
+                stack.append((v, i + 1))
+                w = out[v][i]
+                if not seen[w]:
+                    seen[w] = True
+                    stack.append((w, 0))
+            else:
+                order.append(v)
+
+    component = [-1] * count
+    label = 0
+    for v in reversed(order):
+        if component[v] != -1:
+            continue
+        component[v] = label
+        stack = [v]
+        while stack:
+            x = stack.pop()
+            for y in into[x]:
+                if component[y] == -1:
+                    component[y] = label
+                    stack.append(y)
+        label += 1
+    return component
 
 
 def _walk_neighbours(a, areas):
@@ -1404,7 +1860,40 @@ class _Proximity:
 MAX_SYNTHETIC_STEP = 24.0
 
 
-def _entity_endpoint(a, areanum, point, origins, flags, area_nodes,
+def _ladder_endpoint(areanum, origin, area_flags, reuse, origins, flags,
+                     radii, area_nodes, offer, st):
+    """The node a ladder link attaches to at `origin`, creating one if need be.
+
+    Unlike :func:`_entity_endpoint` this does not settle for the nearest node
+    in the area: a ladder's traversal *is* its two node origins, so a node
+    further than `reuse` away is the wrong place to start or finish the climb
+    and a dedicated one goes in, walk-linked both ways to the nearest node of
+    the same area. That is safe at any distance inside one area -- AAS areas
+    are convex, so the segment between two points in one of them is walkable,
+    the same argument :func:`_walk_neighbours` rests on.
+
+    Nightdive's own foot nodes are dedicated in the same way: the nearest
+    other node is a median 80 units off (minimum 17.2), and 126 of the 270
+    have no link but the climb and one walk back.
+    """
+    siblings = area_nodes.get(areanum) or ()
+    nearest = _nearest(origins, siblings, origin)
+    if nearest is not None and math.dist(origins[nearest], origin) <= reuse:
+        return nearest
+    if nearest is None:
+        return None
+    index = len(origins)
+    origins.append(origin)
+    flags.append(area_flags)
+    radii.append(DEFAULT_RADIUS)
+    area_nodes[areanum] = list(siblings) + [index]
+    offer(index, nearest, nav3.LinkType.WALK, None, 0.0)
+    offer(nearest, index, nav3.LinkType.WALK, None, 0.0)
+    st.nodes_synthesised += 1
+    return index
+
+
+def _entity_endpoint(a, areanum, point, origins, flags, radii, area_nodes,
                      spacing, offer, st):
     """The node index a synthesised link should attach to at `point`.
 
@@ -1443,6 +1932,7 @@ def _entity_endpoint(a, areanum, point, origins, flags, area_nodes,
     index = len(origins)
     origins.append(origin)
     flags.append(0)
+    radii.append(DEFAULT_RADIUS)
     offer(index, neighbour, nav3.LinkType.WALK, None, 0.0)
     offer(neighbour, index, nav3.LinkType.WALK, None, 0.0)
     st.nodes_synthesised += 1

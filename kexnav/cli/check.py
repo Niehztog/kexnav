@@ -378,6 +378,12 @@ def compare(name, idnav, gen, stats, spawns, id_spawns, spacing, verbose=False,
             if stats.pushers_unresolved:
                 print(f"                 unresolved push triggers: "
                       f"{dict(stats.pushers_unresolved)}")
+        if stats.ladders or stats.ladders_unresolved:
+            print(f"                 {stats.ladders} ladder(s), "
+                  f"{stats.ladders_reversed} with a descent link")
+            if stats.ladders_unresolved:
+                print(f"                 unresolved ladders: "
+                      f"{dict(stats.ladders_unresolved)}")
 
     covered = sum(1 for d in to_gen if d <= spacing)
     return {
